@@ -1915,14 +1915,48 @@ async function sub(iId, fId, okId, cId) {
     console.error('Waitlist submission error:', err);
   }
 
-  /* ── Update UI ── */
+  /* ── Update UI — show success banner, then restore form after 5s ── */
   count++;
-  if (fEl)  fEl.style.display  = 'none';
-  if (okEl) okEl.style.display = 'flex';
-  if (cEl)  cEl.textContent    = count;
+  if (cEl) cEl.textContent = count;
 
-  /* ── Persist so both forms hide on return visits ── */
-  localStorage.setItem('rs', email);
+  if (fEl && okEl) {
+    /* Hide form, show success banner */
+    fEl.style.display  = 'none';
+    okEl.style.display = 'flex';
+    okEl.style.opacity = '1';
+    okEl.style.transition = 'opacity 0.6s ease';
+
+    /* After 5 seconds, fade the banner out then restore the form */
+    setTimeout(() => {
+      okEl.style.opacity = '0';
+
+      setTimeout(() => {
+        /* Hide banner, restore form */
+        okEl.style.display = 'none';
+        okEl.style.opacity = '1';   /* reset for next submission */
+        fEl.style.display  = 'flex';
+
+        /* Clear the input so a new address can be entered */
+        if (inp) {
+          inp.value = '';
+          inp.placeholder = 'Your work email address';
+          inp.style.outline = '';
+        }
+
+        /* Re-enable the button */
+        if (btn) {
+          btn.textContent = 'Get early access \u2192';
+          btn.style.opacity = '1';
+          btn.style.pointerEvents = 'auto';
+          /* Normalise label for the footer CTA button */
+          if (fId === 'cf') btn.textContent = 'Secure my spot \u2192';
+        }
+      }, 650); /* matches the 0.6s CSS transition */
+
+    }, 5000); /* 5-second display window */
+  }
+
+  /* LocalStorage persistence removed — forms always reload fresh */
 }
 
 function goWaitlist() {
@@ -1944,10 +1978,7 @@ function goWaitlist() {
   });
 });
 
-if (localStorage.getItem('rs')) {
-  ['hf', 'cf'].forEach(id => { const e = document.getElementById(id); if (e) e.style.display = 'none'; });
-  ['ho', 'co'].forEach(id => { const e = document.getElementById(id); if (e) e.style.display = 'flex'; });
-}
+/* Forms always load active — no session lock */
 
 const nav = document.getElementById('nav');
 window.addEventListener('scroll', () => {
