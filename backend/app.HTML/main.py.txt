@@ -1,0 +1,404 @@
+"""
+main.py
+─────────────────────────────────────────────────────────────────────────────
+ReviewSnipper FastAPI application entry point.
+
+This file:
+  - Creates the FastAPI application instance
+  - Registers CORS middleware
+  - Mounts all route handlers
+  - Defines the health check endpoint
+  - Defines the /auth/register endpoint
+
+To run locally:
+    uvicorn app.main:app --reload --port 8000
+
+To run in production (Railway starts this via Procfile):
+    uvicorn app.main:app --host 0.0.0.0 --port $PORT
+─────────────────────────────────────────────────────────────────────────────
+"""
+
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi.middleware.cors import CORSMiddleware
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from .database import Base, engine, get_db
+from .models import User
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# APPLICATION SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="ReviewSnipper API",
+    description="AI-powered brand and competitor review intelligence for SMBs.",
+    version="1.0.0",
+    # Disable the automatic /docs and /redoc pages in production.
+    # Set ENABLE_DOCS=true in your .env to turn them on during development.
+    docs_url="/docs" if os.getenv("ENABLE_DOCS", "false").lower() == "true" else None,
+    redoc_url=None,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATABASE TABLES
+# Create all tables on startup if they do not already exist.
+# In production we use Alembic migrations instead — but this is a
+# safe fallback that does nothing if tables are already present.
+# ─────────────────────────────────────────────────────────────────────────────
+
+Base.metadata.create_all(bind=engine)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORS MIDDLEWARE
+#
+# CORS (Cross-Origin Resource Sharing) controls which domains are allowed
+# to make API requests from a browser.
+#
+# Why this matters:
+#   Without CORS headers, a browser will block requests from reviewsnipper.com
+#   to api.reviewsnipper.com because they are different origins.
+#
+# allow_origins:
+#   We explicitly list every allowed origin.
+#   Never use ["*"] in production — it allows any website to call your API.
+#
+# allow_credentials=True:
+#   Required for httpOnly cookie authentication to work.
+#   The browser will include the auth cookie on cross-origin requests.
+#
+# allow_methods / allow_headers:
+#   The specific HTTP methods and headers our frontend uses.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ALLOWED_ORIGINS = [
+    # Production
+    "https://reviewsnipper.com",
+    "https://www.reviewsnipper.com",
+
+    # Vercel preview deployments (the landing page)
+    "https://*.vercel.app",
+
+    # Local development
+    "http://localhost:3000",
+    "http://localhost:5173",   # Vite default port
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,          # required for httpOnly cookie auth
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Accept", "X-Requested-With"],
+    expose_headers=["Set-Cookie"],
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+# bcrypt password hashing context.
+# bcrypt automatically salts passwords and is resistant to brute-force attacks.
+# schemes=["bcrypt"] means only bcrypt hashes are accepted — no weaker algorithms.
+# deprecated="auto" automatically flags old hash formats for re-hashing on login.
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# JWT configuration.
+# SECRET_KEY must be a long random string — never hardcode it.
+# Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
+# Set it as an environment variable in Railway and your .env file.
+JWT_SECRET_KEY    = os.environ.get("JWT_SECRET_KEY", "")
+JWT_ALGORITHM     = "HS256"
+JWT_EXPIRE_HOURS  = int(os.environ.get("JWT_EXPIRE_HOURS", "72"))
+
+if not JWT_SECRET_KEY:
+    raise RuntimeError(
+        "JWT_SECRET_KEY environment variable is not set.\n"
+        "Generate one: python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+        "Add it to your .env file and Railway environment variables."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PYDANTIC SCHEMAS
+# These define the shape of request bodies and response payloads.
+# Pydantic validates incoming JSON automatically before our code runs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    """Request body for POST /auth/register."""
+    email:    EmailStr = Field(
+        ...,
+        description="Valid email address — stored in lowercase",
+        examples=["user@example.com"],
+    )
+    password: str = Field(
+        ...,
+        min_length=8,
+        max_length=128,
+        description="Password — minimum 8 characters",
+    )
+
+    model_config = {"str_strip_whitespace": True}
+
+
+class RegisterResponse(BaseModel):
+    """Success response returned after a successful registration."""
+    message:           str
+    user_id:           str
+    email:             str
+    subscription:      str
+    trial_ends_at:     Optional[str]
+    verify_email_sent: bool
+
+
+class HealthResponse(BaseModel):
+    """Response body for GET /health."""
+    status:  str
+    service: str
+    version: str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def hash_password(plaintext: str) -> str:
+    """
+    Hash a plaintext password using bcrypt.
+
+    bcrypt automatically:
+      - Generates a random salt for each hash
+      - Applies a work factor (cost) making brute-force attacks slow
+      - Produces a different hash every time, even for the same password
+
+    The resulting hash is safe to store in the database.
+    The plaintext password is never stored anywhere.
+    """
+    return pwd_context.hash(plaintext)
+
+
+def verify_password(plaintext: str, hashed: str) -> bool:
+    """
+    Verify a plaintext password against a stored bcrypt hash.
+    Returns True if the password matches, False otherwise.
+    Used during login.
+    """
+    return pwd_context.verify(plaintext, hashed)
+
+
+def create_access_token(user_id: str, email: str) -> str:
+    """
+    Create a signed JWT access token for an authenticated user.
+
+    The token payload contains:
+      sub  — the user's UUID (subject)
+      email — the user's email address
+      exp  — expiry timestamp (72 hours from now by default)
+
+    The token is signed with JWT_SECRET_KEY using HS256.
+    Any tampering with the payload will cause signature verification to fail.
+    """
+    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
+    payload = {
+        "sub":   user_id,
+        "email": email,
+        "exp":   expire,
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def set_auth_cookie(response: Response, token: str) -> None:
+    """
+    Set the JWT token as an httpOnly secure cookie on the response.
+
+    httpOnly=True
+        The cookie cannot be read by JavaScript (document.cookie).
+        This prevents XSS attacks from stealing the token.
+
+    secure=True
+        The cookie is only sent over HTTPS connections.
+        Prevents interception over HTTP.
+
+    samesite="lax"
+        The cookie is sent on same-site requests and top-level navigation.
+        Prevents CSRF attacks while allowing normal navigation.
+
+    max_age
+        Cookie lifetime in seconds. Matches the JWT expiry.
+    """
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=JWT_EXPIRE_HOURS * 3600,
+        path="/",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Health check ─────────────────────────────────────────────────────────────
+
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Health check",
+    description="Returns the operational status of the API. "
+                "Used by Railway and uptime monitors.",
+    tags=["System"],
+)
+def health_check() -> HealthResponse:
+    """
+    Lightweight health check endpoint.
+
+    Called by:
+      - Railway to determine if the container is healthy
+      - Uptime monitoring services (e.g. UptimeRobot)
+      - The frontend to verify the API is reachable
+
+    Does not query the database — a pure in-memory response.
+    Returns 200 OK when the process is running.
+    """
+    return HealthResponse(
+        status="healthy",
+        service="ReviewSnipper API",
+        version="1.0.0",
+    )
+
+
+# ── Registration ─────────────────────────────────────────────────────────────
+
+@app.post(
+    "/auth/register",
+    response_model=RegisterResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a new user account",
+    description="Creates a new user, hashes their password, starts a 14-day "
+                "Pro trial, and returns a JWT in an httpOnly cookie.",
+    tags=["Authentication"],
+)
+def register(
+    request:  RegisterRequest,
+    response: Response,
+    db:       Session = Depends(get_db),
+) -> RegisterResponse:
+    """
+    Register a new ReviewSnipper user account.
+
+    Steps performed:
+    1.  Normalise email to lowercase and strip whitespace
+    2.  Check the email is not already registered
+    3.  Hash the password with bcrypt — plaintext never stored
+    4.  Create the User row in PostgreSQL
+    5.  Start a 14-day Pro trial automatically
+    6.  Generate a signed JWT access token
+    7.  Set the token as an httpOnly cookie on the response
+    8.  Return a success payload (no sensitive data)
+
+    Error responses:
+    - 400 Bad Request  — email already registered
+    - 422 Unprocessable Entity — invalid email format or password too short
+    - 500 Internal Server Error — unexpected database error
+    """
+
+    # ── Step 1: Normalise email ───────────────────────────────────────────────
+    # Always store and compare emails in lowercase to prevent duplicate
+    # accounts from "User@Example.com" and "user@example.com".
+    normalised_email = request.email.lower().strip()
+
+    # ── Step 2: Check for existing account ───────────────────────────────────
+    # Query before attempting insert to return a clean error message.
+    # (The unique constraint on email would catch this anyway, but the
+    # IntegrityError would be less user-friendly to parse.)
+    existing = db.query(User).filter(User.email == normalised_email).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error":   "email_already_registered",
+                "message": "An account with this email address already exists. "
+                           "Please sign in or use the password reset flow.",
+            },
+        )
+
+    # ── Step 3: Hash the password ─────────────────────────────────────────────
+    # hash_password() calls bcrypt via passlib.
+    # The result is a 60-character string like:
+    # "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW"
+    # This is safe to store — it cannot be reversed to the plaintext.
+    hashed = hash_password(request.password)
+
+    # ── Step 4 & 5: Create user with 14-day trial ────────────────────────────
+    trial_end = datetime.now(timezone.utc) + timedelta(days=14)
+
+    new_user = User(
+        email=normalised_email,
+        hashed_password=hashed,
+        subscription_status="trial",
+        trial_ends_at=trial_end,
+        is_verified=False,
+    )
+
+    try:
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)   # reload the row to get the server-generated UUID
+
+    except IntegrityError:
+        # This catches a race condition where two identical registrations
+        # arrive simultaneously and both pass the duplicate check above.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error":   "email_already_registered",
+                "message": "An account with this email address already exists.",
+            },
+        )
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error":   "registration_failed",
+                "message": "We could not create your account. "
+                           "Please try again in a moment.",
+            },
+        ) from exc
+
+    # ── Step 6 & 7: Issue JWT in httpOnly cookie ──────────────────────────────
+    token = create_access_token(
+        user_id=str(new_user.id),
+        email=new_user.email,
+    )
+    set_auth_cookie(response, token)
+
+    # ── Step 8: Return success payload ───────────────────────────────────────
+    # Never include hashed_password or any sensitive field in the response.
+    return RegisterResponse(
+        message="Account created successfully. "
+                "Please check your email to verify your address.",
+        user_id=str(new_user.id),
+        email=new_user.email,
+        subscription=new_user.subscription_status,
+        trial_ends_at=trial_end.isoformat(),
+        verify_email_sent=True,   # email sending added in Stage 7
+    )
