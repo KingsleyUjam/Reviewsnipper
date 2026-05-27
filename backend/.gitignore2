@@ -1,0 +1,13 @@
+# Ignore local environment variable secrets vaults
+.env
+.env.local
+
+# Ignore local Python runtime cache folders
+__pycache__/
+*.pyc
+.pytest_cache/
+backend/app/__pycache__/
+
+# Ignore local operating system junk
+Thumbs.db
+.DS_Store
