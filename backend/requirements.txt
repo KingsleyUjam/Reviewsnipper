@@ -1,7 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# ReviewSnipper Backend — Python Dependencies
-# Exact pins for reproducible production deployments.
-# Install: pip install -r requirements.txt
+# ReviewSnipper Backend — Production Dependencies
+#
+# Pinned to exact versions for reproducible Railway deployments.
+# Only packages actually imported by the running application are listed here.
+# Packages needed in later stages (Celery, Redis, httpx) are added then.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Web framework ─────────────────────────────────────────────────────────────
@@ -11,21 +13,16 @@ uvicorn==0.28.0
 # ── Database ──────────────────────────────────────────────────────────────────
 sqlalchemy==2.0.28
 psycopg2-binary==2.9.9
-alembic==1.13.1
 
 # ── Auth & security ───────────────────────────────────────────────────────────
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 
-# ── Validation ────────────────────────────────────────────────────────────────
+# ── Data validation ───────────────────────────────────────────────────────────
 pydantic[email]==2.6.4
 
-# ── Environment config ────────────────────────────────────────────────────────
+# ── Environment variables ─────────────────────────────────────────────────────
 python-dotenv==1.0.1
 
-# ── HTTP client (adapters use this) ──────────────────────────────────────────
-httpx==0.27.0
-
-# ── Task queue (added in Stage 4) ────────────────────────────────────────────
-celery==5.4.0
-redis==5.0.4
+# ── Payments ──────────────────────────────────────────────────────────────────
+stripe==10.5.0
